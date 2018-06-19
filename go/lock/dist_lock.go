@@ -1,7 +1,11 @@
+/********分布式锁需要考虑的场景********/
+//1、获取锁之后，进程故障。需要给锁加过期时间，需要保证原子性。所以使用SET，如果使用SETNX后加超时，需要靠其他进程检查到无过期时间后设置。
+//2、del误删场景。判断是否自己加的，是才删。判断、删要保持原子性，可以通过lua实现。
+//3、获取锁后，业务处理时间超过锁过期时间，需要开守护线程续航。
+
+/************SET注意事项**************/
 //命令 SET resource-name anystring NX EX max-lock-time 是一种在 Redis 中实现锁的简单方法。
-
 //客户端执行以上的命令：
-
 //如果服务器返回 OK ，那么这个客户端获得锁。
 //如果服务器返回 NIL ，那么客户端获取锁失败，可以在稍后再重试。
 //设置的过期时间到达之后，锁将自动释放。
@@ -10,7 +14,6 @@
 //不使用固定的字符串作为键的值，而是设置一个不可猜测（non-guessable）的长随机字符串，作为口令串（token）。
 //不使用 DEL 命令来释放锁，而是发送一个 Lua 脚本，这个脚本只在客户端传入的值和键的口令串相匹配时，才对键进行删除。
 //这两个改动可以防止持有过期锁的客户端误删现有锁的情况出现。
-
 
 //NX ：只在键不存在时，才对键进行设置操作。 SET key value NX 效果等同于 SETNX key value 。
 //XX ：只在键已经存在时，才对键进行设置操作。
@@ -24,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"errors"
 	"github.com/gomodule/redigo/redis"
 )
 
@@ -31,17 +35,16 @@ type diskLock interface {
 	//首次获取锁
 	Lock(c redis.Conn, name string, acquireTime, lockTime time.Duration) error
 	//释放锁
-	Unlock(c redis.Conn) bool
+	Unlock(c redis.Conn) error
 }
 
 type DistLock struct {
-	name   		string
-	lockTime    time.Duration
-	token       string
-	lockMutex   sync.Mutex
-	releasec   chan interface{}
+	name      string
+	lockTime  time.Duration
+	token     string
+	lockMutex sync.Mutex
+	releasec  chan interface{}
 }
-
 
 func (m *DistLock) Lock(c redis.Conn, name string, acquireTime, lockTime time.Duration) error {
 	m.lockMutex.Lock()
@@ -57,12 +60,12 @@ func (m *DistLock) Lock(c redis.Conn, name string, acquireTime, lockTime time.Du
 	m.token = token
 
 	endTime := time.Duration(time.Now().Unix()) + acquireTime
-	for{
+	for {
 		if time.Duration(time.Now().Unix()) >= endTime {
-			break
+			return errors.New("lock timeout")
 		}
 
-		if ok := m.acquire(c); ok{
+		if ok := m.acquire(c); ok {
 			m.releasec = make(chan interface{})
 			break
 		}
@@ -70,10 +73,10 @@ func (m *DistLock) Lock(c redis.Conn, name string, acquireTime, lockTime time.Du
 	}
 
 	//守护Goroutine，用于续时间
-	go func(){
-		for{
-			delayTime := m.lockTime*time.Second*9/10  //适当提前一点时间
-			select{
+	go func() {
+		for {
+			delayTime := m.lockTime * time.Second * 9 / 10 //适当提前一点时间
+			select {
 			case <-time.After(delayTime):
 				m.reNew(c)
 			case <-m.releasec:
@@ -84,19 +87,18 @@ func (m *DistLock) Lock(c redis.Conn, name string, acquireTime, lockTime time.Du
 	return nil
 }
 
-func (m *DistLock) Unlock(c redis.Conn) bool {
+func (m *DistLock) Unlock(c redis.Conn) error {
 	m.lockMutex.Lock()
 	defer m.lockMutex.Unlock()
 
-	if ok:= m.release(c); ok{
-		if m.releasec != nil{
+	var ok bool
+	if ok = m.release(c); ok {
+		if m.releasec != nil {
 			close(m.releasec)
 			m.releasec = nil
 		}
-		return ok
-	}else{
-		return ok
 	}
+	return nil
 }
 
 func (m *DistLock) genToken() (string, error) {
